@@ -19,7 +19,7 @@ PREFERRED_TITLE_NAMES = ["Title", "Project Title", "Capstone Title", "title", "p
 
 # ===================== HELPERS =====================
 def expand_query(q: str) -> str:
-    """Tiny typo fixes + micro expansions for short queries."""
+    """Small typo fixes + expansions for common abbreviations."""
     q2 = q.lower().strip()
     fixes = {
         "artifical": "artificial",
@@ -40,7 +40,7 @@ def expand_query(q: str) -> str:
 @st.cache_resource(show_spinner=False)
 def load_sbert_model():
     from sentence_transformers import SentenceTransformer
-    # small & fast; good for short titles
+    # Compact, fast SBERT model suitable for sentence/title similarity
     return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 @st.cache_data(show_spinner=False)
@@ -68,7 +68,10 @@ def clean_titles(series: pd.Series) -> pd.Series:
 
 @st.cache_data(show_spinner=False)
 def build_tfidf(titles: pd.Series):
-    # Character n-grams are robust to short titles & typos
+    """
+    Build a character n-gram TF-IDF model.
+    Character n-grams make the model robust to typos and short titles.
+    """
     vec = TfidfVectorizer(
         analyzer="char_wb",
         ngram_range=(3, 5),
@@ -81,36 +84,72 @@ def build_tfidf(titles: pd.Series):
 
 @st.cache_data(show_spinner=False)
 def embed_titles(titles: pd.Series):
+    """
+    Encode all existing titles once with SBERT.
+    """
     model = load_sbert_model()
     embs = model.encode(titles.tolist(), normalize_embeddings=True, show_progress_bar=False)
     return np.asarray(embs)
 
-def compute_hybrid(query: str, titles: pd.Series, tfidf_vec, tfidf_mat, sbert_embs,
-                   w_sbert: float = 0.80, w_tfidf: float = 0.20):
+def compute_hybrid(
+    query: str,
+    titles: pd.Series,
+    tfidf_vec,
+    tfidf_mat,
+    sbert_embs,
+    tfidf_cutoff: float = 0.10,
+    w_sbert: float = 0.80,
+    w_tfidf: float = 0.20,
+):
+    """
+    Compute TF-IDF %, SBERT %, and an adaptive Hybrid % for a query.
+
+    Design choices for interpretability:
+    - TF-IDF: use raw cosine similarity (0–1), NOT forced max=1.
+    - SBERT: cosine in [-1,1] mapped to [0,1].
+    - Hybrid:
+        * If TF-IDF < tfidf_cutoff (little lexical overlap) -> Hybrid = SBERT.
+        * Else -> Hybrid = 0.8*SBERT + 0.2*TF-IDF.
+      This prevents unrelated titles (low TF-IDF) from getting artificially high Hybrid scores.
+    """
     if not query or not query.strip():
         return None
+
     q = expand_query(query)
 
-    # TF-IDF cosine (relative scaling per query)
+    # ---------- TF-IDF SIMILARITY (raw cosine, no per-query 0–1 scaling) ----------
     q_tfidf = tfidf_vec.transform([q])
-    sim_tfidf = cosine_similarity(q_tfidf, tfidf_mat).ravel()
-    # scale to [0,1] so the best lexical match is 100%
-    sim_tfidf = (sim_tfidf - sim_tfidf.min()) / (sim_tfidf.max() - sim_tfidf.min() + 1e-12)
+    sim_tfidf_raw = cosine_similarity(q_tfidf, tfidf_mat).ravel()
+    # In practice cosine for tf-idf is already [0,1], but clip for safety
+    sim_tfidf = np.clip(sim_tfidf_raw, 0.0, 1.0)
 
-    # SBERT cosine in [-1,1] -> normalize to [0,1]
+    # ---------- SBERT SIMILARITY ----------
     model = load_sbert_model()
     q_emb = model.encode([q], normalize_embeddings=True, show_progress_bar=False)
-    sim_sbert = (sbert_embs @ q_emb[0]).ravel()
-    sim_sbert = (sim_sbert + 1.0) / 2.0
+    sim_sbert_raw = (sbert_embs @ q_emb[0]).ravel()          # in [-1, 1]
+    sim_sbert = (sim_sbert_raw + 1.0) / 2.0                  # -> [0, 1]
+    sim_sbert = np.clip(sim_sbert, 0.0, 1.0)
 
-    sim_hybrid = w_sbert * sim_sbert + w_tfidf * sim_tfidf
+    # ---------- ADAPTIVE HYBRID ----------
+    # If lexical overlap is very small, trust semantic similarity only.
+    use_sbert_only = sim_tfidf < tfidf_cutoff
+    hybrid = np.empty_like(sim_sbert)
 
-    # Return as percentages
-    return (
-        np.nan_to_num(sim_tfidf * 100.0, nan=0.0),
-        np.nan_to_num(sim_sbert * 100.0, nan=0.0),
-        np.nan_to_num(np.clip(sim_hybrid, 0, 1) * 100.0, nan=0.0),
+    # Case 1: very low lexical overlap -> Hybrid = SBERT
+    hybrid[use_sbert_only] = sim_sbert[use_sbert_only]
+
+    # Case 2: reasonable lexical overlap -> blend SBERT + TF-IDF
+    hybrid[~use_sbert_only] = (
+        w_sbert * sim_sbert[~use_sbert_only]
+        + w_tfidf * sim_tfidf[~use_sbert_only]
     )
+
+    # ---------- CONVERT TO PERCENTAGES ----------
+    tfidf_pct = np.nan_to_num(sim_tfidf * 100.0, nan=0.0)
+    sbert_pct = np.nan_to_num(sim_sbert * 100.0, nan=0.0)
+    hybrid_pct = np.nan_to_num(np.clip(hybrid, 0, 1) * 100.0, nan=0.0)
+
+    return tfidf_pct, sbert_pct, hybrid_pct
 
 # ===================== UI: DATA SOURCE =====================
 with st.expander("📄 Data Source (Google Sheet CSV)"):
@@ -182,17 +221,17 @@ if df is not None:
         if sims is None:
             st.warning("Please enter a title.")
         else:
-            sim_tfidf_pct, sim_sbert_pct, sim_hybrid_pct = sims
-            order = np.argsort(-sim_hybrid_pct)
+            tfidf_pct, sbert_pct, hybrid_pct = sims
+            order = np.argsort(-hybrid_pct)
             k = int(min(top_k, len(titles)))
             idx = order[:k]
 
             results = pd.DataFrame({
                 "Rank": np.arange(1, k + 1),
                 "Existing Title": titles.iloc[idx].values,
-                "Hybrid %": np.round(sim_hybrid_pct[idx], 2),
-                "SBERT %": np.round(sim_sbert_pct[idx], 2),
-                "TF-IDF %": np.round(sim_tfidf_pct[idx], 2),
+                "Hybrid %": np.round(hybrid_pct[idx], 2),
+                "SBERT %": np.round(sbert_pct[idx], 2),
+                "TF-IDF %": np.round(tfidf_pct[idx], 2),
             })
 
             st.subheader("Top Matches")
@@ -218,12 +257,29 @@ if df is not None:
                 mime="text/csv",
             )
 
-            with st.expander("How scoring works"):
+            with st.expander("How to interpret the scores"):
                 st.markdown(
-                    "- **SBERT (80%)**: semantic similarity (meaning), cosine normalized to 0–100%.\n"
-                    "- **TF-IDF (20%)**: character n-gram overlap (robust to typos & short titles), rescaled so the best lexical match is 100%.\n"
-                    "- **Hybrid %** = 0.8 × SBERT % + 0.2 × TF-IDF %.\n\n"
-                    "Scores are relative to the projects in the current Google Sheet. If no truly similar project exists, even the best match may still be only moderately related."
+                    """
+                    **TF-IDF % (lexical similarity)**  
+                    - Based on character n-gram cosine similarity.  
+                    - Values close to 0% → very little word/character overlap.  
+                    - Values above ~30–40% → strong overlap in phrases or spelling.  
+
+                    **SBERT % (semantic similarity)**  
+                    - Based on SBERT cosine similarity, mapped from [-1,1] to [0–100%].  
+                    - Captures meaning, synonyms, and paraphrasing.  
+
+                    **Hybrid % (adaptive blend)**  
+                    - If TF-IDF < 10% (almost no lexical overlap), Hybrid = SBERT %.  
+                    - If TF-IDF ≥ 10%, Hybrid = 0.8 × SBERT % + 0.2 × TF-IDF %.  
+                    - Rough guideline:  
+                        * < 40% → weak similarity  
+                        * 40–70% → moderate topic overlap (worth reviewing)  
+                        * > 70% → strong similarity; potential duplication risk  
+
+                    Scores are always **relative to the projects in the current Google Sheet**.  
+                    The tool is designed to **assist faculty**, not replace academic judgement.
+                    """
                 )
 
 st.markdown("---")
