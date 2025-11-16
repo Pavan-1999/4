@@ -91,9 +91,10 @@ def compute_hybrid(query: str, titles: pd.Series, tfidf_vec, tfidf_mat, sbert_em
         return None
     q = expand_query(query)
 
-    # TF-IDF cosine (rescale to [0,1])
+    # TF-IDF cosine (relative scaling per query)
     q_tfidf = tfidf_vec.transform([q])
     sim_tfidf = cosine_similarity(q_tfidf, tfidf_mat).ravel()
+    # scale to [0,1] so the best lexical match is 100%
     sim_tfidf = (sim_tfidf - sim_tfidf.min()) / (sim_tfidf.max() - sim_tfidf.min() + 1e-12)
 
     # SBERT cosine in [-1,1] -> normalize to [0,1]
@@ -117,7 +118,7 @@ with st.expander("📄 Data Source (Google Sheet CSV)"):
         "Paste your **published-to-web CSV** link (must end with `output=csv`):",
         value=DEFAULT_SHEET_URL,
     )
-    st.caption("Google Sheets → File → Share → Publish to web → CSV → copy link.")
+    st.caption("Google Sheets → File → Share → Publish to web → CSV → copy the link.")
 
 # Load the sheet
 df = None
@@ -139,7 +140,25 @@ if df is not None:
         st.error("No non-empty titles found in the detected column.")
         st.stop()
 
-    st.info(f"Loaded **{len(titles)}** titles from column **{picked_col}**.")
+    # ---------- DATASET OVERVIEW ----------
+    st.markdown("### Dataset overview")
+    col_a, col_b = st.columns(2)
+    col_a.metric("Total projects loaded", len(titles))
+
+    # If there's a Year column, show projects per year
+    year_col = None
+    for cand in ["Year", "year", "Academic Year", "Year_of_Completion"]:
+        if cand in df.columns:
+            year_col = cand
+            break
+
+    if year_col:
+        year_counts = df[year_col].value_counts().sort_index()
+        col_b.bar_chart(year_counts, use_container_width=True)
+        col_b.caption(f"Projects per {year_col}")
+    else:
+        col_b.write("Add a 'Year' column in your sheet to see projects per year.")
+
     with st.expander("Preview (first 5 titles)"):
         st.write(pd.DataFrame(titles.head(5), columns=["Title"]))
 
@@ -148,6 +167,7 @@ if df is not None:
     sbert_embs = embed_titles(titles)
 
     # ===================== UI: QUERY & RESULTS =====================
+    st.markdown("### Check a new capstone title")
     qcol1, qcol2 = st.columns([2, 1])
     with qcol1:
         query_title = st.text_input(
@@ -178,6 +198,18 @@ if df is not None:
             st.subheader("Top Matches")
             st.dataframe(results, use_container_width=True)
 
+            # ---------- METRICS FOR THIS QUERY ----------
+            st.markdown("#### Similarity summary (Top matches)")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Highest Hybrid %", f"{results['Hybrid %'].max():.1f}")
+            m2.metric("Lowest Hybrid %", f"{results['Hybrid %'].min():.1f}")
+            m3.metric("Average Hybrid %", f"{results['Hybrid %'].mean():.1f}")
+
+            # ---------- BAR CHART OF HYBRID SCORES ----------
+            st.markdown("#### Hybrid similarity scores for Top matches")
+            chart_df = results[["Existing Title", "Hybrid %"]].set_index("Existing Title")
+            st.bar_chart(chart_df, use_container_width=True)
+
             # Download
             st.download_button(
                 "⬇️ Download results (CSV)",
@@ -189,8 +221,9 @@ if df is not None:
             with st.expander("How scoring works"):
                 st.markdown(
                     "- **SBERT (80%)**: semantic similarity (meaning), cosine normalized to 0–100%.\n"
-                    "- **TF-IDF (20%)**: character n-gram overlap (robust to typos & short titles).\n"
-                    "- **Hybrid %** = 0.8 × SBERT % + 0.2 × TF-IDF %."
+                    "- **TF-IDF (20%)**: character n-gram overlap (robust to typos & short titles), rescaled so the best lexical match is 100%.\n"
+                    "- **Hybrid %** = 0.8 × SBERT % + 0.2 × TF-IDF %.\n\n"
+                    "Scores are relative to the projects in the current Google Sheet. If no truly similar project exists, even the best match may still be only moderately related."
                 )
 
 st.markdown("---")
